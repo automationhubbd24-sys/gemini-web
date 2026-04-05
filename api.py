@@ -139,34 +139,44 @@ async def get_next_client(db: Session) -> GeminiClient:
     """Get the next Gemini client in a Round-Robin fashion (A -> B -> C)."""
     global active_clients, rotation_index
     
-    # 1. Get all alive cookies from DB, ordered by ID for consistent rotation
+    # 1. Get all alive cookies from DB
     cookies = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").order_by(Cookie.id).all()
     if not cookies:
         raise HTTPException(status_code=503, detail="No active Gemini cookies available")
     
-    # 2. Select the next cookie in the list
-    async with client_lock:
+    # 2. Prefer already initialized clients to save time
+    # Check if current rotation index client is already in memory
+    for _ in range(len(cookies)):
         if rotation_index >= len(cookies):
             rotation_index = 0
         
         selected_cookie = cookies[rotation_index]
-        rotation_index = (rotation_index + 1) % len(cookies)
-        
-        # 3. If client already in memory, return it (Fast)
         if selected_cookie.gmail in active_clients:
             client, _ = active_clients[selected_cookie.gmail]
-            active_clients[selected_cookie.gmail] = (client, time.time())
+            rotation_index = (rotation_index + 1) % len(cookies)
             return client
         
-        # 4. Otherwise, initialize new client (Initial delay only)
+        rotation_index = (rotation_index + 1) % len(cookies)
+
+    # 3. If no cached client is found, pick the one at rotation_index and init it
+    if rotation_index >= len(cookies):
+        rotation_index = 0
+    selected_cookie = cookies[rotation_index]
+    rotation_index = (rotation_index + 1) % len(cookies)
+
+    async with client_lock:
+        if selected_cookie.gmail in active_clients:
+            client, _ = active_clients[selected_cookie.gmail]
+            return client
+            
         try:
             print(f"Initializing new client for {selected_cookie.gmail}...")
             client = GeminiClient(selected_cookie.secure_1psid, selected_cookie.secure_1psidts)
-            await client.init()
+            # Minimize init timeout for faster failure detection
+            await client.init(timeout=20, auto_refresh=True)
             active_clients[selected_cookie.gmail] = (client, time.time())
             return client
         except Exception as e:
-            # Mark cookie as dead in DB and try next one
             db.query(Cookie).filter(Cookie.gmail == selected_cookie.gmail).update({"status": "dead"})
             db.add(Log(event_type="error", message=f"Failed to init client: {str(e)}", gmail=selected_cookie.gmail))
             db.commit()
