@@ -28,6 +28,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "evola123")
 active_clients: Dict[str, tuple[GeminiClient, float]] = {}
 sessions: Dict[str, list] = {}
 client_lock = asyncio.Lock()
+rotation_index = 0
 
 # URL Regex to detect links
 URL_REGEX = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+')
@@ -134,46 +135,42 @@ async def extract_content_and_files(messages: List[OpenAIMessage], client: Gemin
             
     return system_prompt, user_message.strip(), temp_files
 
-async def get_random_client(db: Session) -> GeminiClient:
-    """Get a random initialized Gemini client from the active pool in DB."""
-    global active_clients
+async def get_next_client(db: Session) -> GeminiClient:
+    """Get the next Gemini client in a Round-Robin fashion (A -> B -> C)."""
+    global active_clients, rotation_index
     
-    # 1. First, check DB for all alive cookies
-    cookies = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").all()
+    # 1. Get all alive cookies from DB, ordered by ID for consistent rotation
+    cookies = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").order_by(Cookie.id).all()
     if not cookies:
         raise HTTPException(status_code=503, detail="No active Gemini cookies available")
     
-    # 2. Prefer clients already in memory to save init time
-    alive_gmails = [c.gmail for c in cookies]
-    cached_alive = [gmail for gmail in active_clients.keys() if gmail in alive_gmails]
-    
-    if cached_alive:
-        selected_gmail = random.choice(cached_alive)
-        client, _ = active_clients[selected_gmail]
-        active_clients[selected_gmail] = (client, time.time())
-        return client
-
-    # 3. If no cached client, pick a random one from DB and init
-    selected_cookie = random.choice(cookies)
-    
+    # 2. Select the next cookie in the list
     async with client_lock:
-        # Double check after lock
+        if rotation_index >= len(cookies):
+            rotation_index = 0
+        
+        selected_cookie = cookies[rotation_index]
+        rotation_index = (rotation_index + 1) % len(cookies)
+        
+        # 3. If client already in memory, return it (Fast)
         if selected_cookie.gmail in active_clients:
             client, _ = active_clients[selected_cookie.gmail]
+            active_clients[selected_cookie.gmail] = (client, time.time())
             return client
-            
+        
+        # 4. Otherwise, initialize new client (Initial delay only)
         try:
-            print(f"Initializing new client for {selected_cookie.gmail} (this might take a few seconds)...")
+            print(f"Initializing new client for {selected_cookie.gmail}...")
             client = GeminiClient(selected_cookie.secure_1psid, selected_cookie.secure_1psidts)
             await client.init()
             active_clients[selected_cookie.gmail] = (client, time.time())
             return client
         except Exception as e:
-            # Mark cookie as dead in DB
+            # Mark cookie as dead in DB and try next one
             db.query(Cookie).filter(Cookie.gmail == selected_cookie.gmail).update({"status": "dead"})
             db.add(Log(event_type="error", message=f"Failed to init client: {str(e)}", gmail=selected_cookie.gmail))
             db.commit()
-            return await get_random_client(db)
+            return await get_next_client(db)
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
     key_entry = db.query(APIKey).filter(APIKey.key == credentials.credentials, APIKey.is_active == True).first()
@@ -197,7 +194,7 @@ async def root():
 
 @app.post("/chat")
 async def chat(request: ChatRequest, token: str = Depends(verify_token), db: Session = Depends(get_db)):
-    client = await get_random_client(db)
+    client = await get_next_client(db)
     temp_files = await download_files_from_message(request.message, client)
     try:
         metadata = sessions.get(request.session_id)
@@ -227,7 +224,7 @@ async def list_models(token: str = Depends(verify_token)):
 
 @app.post("/v1/chat/completions")
 async def openai_chat(request: OpenAIRequest, token: str = Depends(verify_token), db: Session = Depends(get_db)):
-    client = await get_random_client(db)
+    client = await get_next_client(db)
     system_prompt, user_message, temp_files = await extract_content_and_files(request.messages, client)
     try:
         session_id = request.user
@@ -262,7 +259,7 @@ async def audio_transcriptions(
     token: str = Depends(verify_token),
     db: Session = Depends(get_db)
 ):
-    client = await get_random_client(db)
+    client = await get_next_client(db)
     temp_path = None
     try:
         ext = Path(file.filename).suffix
