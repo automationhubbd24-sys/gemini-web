@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import os
 import asyncio
@@ -7,36 +9,51 @@ import time
 import re
 import tempfile
 import shutil
+import random
+import io
 from pathlib import Path
 from gemini_webapi import GeminiClient
 from typing import Optional, List, Dict, Any
+from database import init_db, get_db, APIKey, Cookie, Log
+from sqlalchemy.orm import Session
 
 app = FastAPI(title="Evola Gemini Web API")
 
 # Security
 security = HTTPBearer()
-API_KEY = os.getenv("API_KEY")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "evola123")
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if API_KEY and credentials.credentials != API_KEY:
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid or missing API Key"
-        )
-    return credentials.credentials
-
-# Load cookies from environment variables for security
-SECURE_1PSID = os.getenv("SECURE_1PSID")
-SECURE_1PSIDTS = os.getenv("SECURE_1PSIDTS")
-
-client = None
-# In-memory session storage (session_id -> metadata)
+# In-memory client cache (gmail -> GeminiClient)
+active_clients: Dict[str, GeminiClient] = {}
 sessions: Dict[str, list] = {}
+client_lock = asyncio.Lock()
 
 # URL Regex to detect links
 URL_REGEX = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+')
 
-async def download_files_from_message(message: str) -> List[str]:
+# --- Models ---
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+    system_prompt: Optional[str] = "You are a helpful assistant."
+
+class OpenAIMessage(BaseModel):
+    role: str
+    content: Any  # Can be string or list for multimodal
+
+class OpenAIRequest(BaseModel):
+    model: str
+    messages: List[OpenAIMessage]
+    temperature: Optional[float] = 0.7
+    user: Optional[str] = "default_user"
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+# --- Helpers ---
+async def download_files_from_message(message: str, client: GeminiClient = None) -> List[str]:
     """Detect and download files from a message, returns list of local temp file paths."""
     urls = URL_REGEX.findall(message)
     temp_files = []
@@ -47,14 +64,13 @@ async def download_files_from_message(message: str) -> List[str]:
     for url in urls:
         try:
             # We use GeminiClient's session if available, otherwise create a temporary one
-            session = client.client if client and client.client else None
+            session = client.client if client else None
             if not session:
                 from curl_cffi.requests import AsyncSession
                 session = AsyncSession()
             
             response = await session.get(url, timeout=30)
             if response.status_code == 200:
-                # Guess extension from content-type or URL
                 content_type = response.headers.get("content-type", "")
                 ext = ".bin"
                 if "image/png" in content_type: ext = ".png"
@@ -66,7 +82,6 @@ async def download_files_from_message(message: str) -> List[str]:
                 elif "video/mp4" in content_type: ext = ".mp4"
                 elif "application/pdf" in content_type: ext = ".pdf"
                 else:
-                    # Fallback to URL extension
                     url_ext = Path(url.split("?")[0]).suffix
                     if url_ext: ext = url_ext
 
@@ -74,29 +89,12 @@ async def download_files_from_message(message: str) -> List[str]:
                 with os.fdopen(fd, 'wb') as f:
                     f.write(response.content)
                 temp_files.append(temp_path)
-                print(f"Downloaded: {url} -> {temp_path}")
         except Exception as e:
             print(f"Failed to download {url}: {e}")
             
     return temp_files
 
-class ChatRequest(BaseModel):
-    message: str
-    session_id: Optional[str] = None
-    system_prompt: Optional[str] = "You are a helpful assistant."
-
-# --- OpenAI Compatible Models ---
-class OpenAIMessage(BaseModel):
-    role: str
-    content: Any  # Can be string or list for multimodal
-
-class OpenAIRequest(BaseModel):
-    model: str
-    messages: List[OpenAIMessage]
-    temperature: Optional[float] = 0.7
-    user: Optional[str] = "default_user"
-
-async def extract_content_and_files(messages: List[OpenAIMessage]) -> tuple[str, List[str], str]:
+async def extract_content_and_files(messages: List[OpenAIMessage], client: GeminiClient = None) -> tuple[str, str, List[str]]:
     """Extract system prompt, user message text and any file URLs from OpenAI messages."""
     system_prompt = "You are a helpful assistant."
     user_message = ""
@@ -112,78 +110,85 @@ async def extract_content_and_files(messages: List[OpenAIMessage]) -> tuple[str,
         elif msg.role == "user":
             if isinstance(msg.content, str):
                 user_message = msg.content
-                # Detect URLs in text
                 file_urls.extend(URL_REGEX.findall(msg.content))
             elif isinstance(msg.content, list):
                 for item in msg.content:
                     if item.get("type") == "text":
-                        user_message += item.get("text", "") + " "
-                        # Also detect URLs in the text inside list
-                        file_urls.extend(URL_REGEX.findall(item.get("text", "")))
+                        text = item.get("text", "")
+                        user_message += text + " "
+                        file_urls.extend(URL_REGEX.findall(text))
                     elif item.get("type") == "image_url":
                         url = item.get("image_url", {}).get("url", "")
-                        if url:
-                            file_urls.append(url)
-                    elif item.get("type") == "file_url": # Custom support for other files
+                        if url: file_urls.append(url)
+                    elif item.get("type") == "file_url":
                         url = item.get("file_url", {}).get("url", "")
-                        if url:
-                            file_urls.append(url)
+                        if url: file_urls.append(url)
     
-    # Download all detected URLs
     temp_files = []
-    # Use a set to avoid downloading the same URL twice
     unique_urls = list(dict.fromkeys(file_urls))
-    
     for url in unique_urls:
-        # Skip data URLs if they are huge (already handled by download_files_from_message if updated)
-        # But for now let's use our download helper
         try:
-            # Re-use our download logic but for a single URL
-            files = await download_files_from_message(url) # This handles a single URL too
+            files = await download_files_from_message(url, client)
             temp_files.extend(files)
-        except:
-            pass
+        except: pass
             
     return system_prompt, user_message.strip(), temp_files
 
+async def get_random_client(db: Session) -> GeminiClient:
+    """Get a random initialized Gemini client from the active pool in DB."""
+    global active_clients
+    async with client_lock:
+        cookies = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").all()
+        if not cookies:
+            raise HTTPException(status_code=503, detail="No active Gemini cookies available")
+        
+        selected_cookie = random.choice(cookies)
+        if selected_cookie.gmail in active_clients:
+            return active_clients[selected_cookie.gmail]
+        
+        try:
+            client = GeminiClient(selected_cookie.secure_1psid, selected_cookie.secure_1psidts)
+            await client.init()
+            active_clients[selected_cookie.gmail] = client
+            return client
+        except Exception as e:
+            selected_cookie.status = "dead"
+            db.add(Log(event_type="error", message=f"Failed to init client: {str(e)}", gmail=selected_cookie.gmail))
+            db.commit()
+            return await get_random_client(db)
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
+    key_entry = db.query(APIKey).filter(APIKey.key == credentials.credentials, APIKey.is_active == True).first()
+    if not key_entry:
+        raise HTTPException(status_code=403, detail="Invalid or missing API Key")
+    return credentials.credentials
+
+# --- Routes ---
 @app.on_event("startup")
 async def startup_event():
-    global client
-    if not SECURE_1PSID:
-        print("WARNING: SECURE_1PSID is not set!")
-        return
-    
-    client = GeminiClient(SECURE_1PSID, SECURE_1PSIDTS)
-    await client.init()
-    print("Gemini Client initialized successfully.")
+    init_db()
+    print("Evola Gemini System Started.")
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def root():
-    return {"status": "running", "message": "Gemini OpenAI-Compatible API is ready"}
+    try:
+        with open("static/index.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except:
+        return "Evola Dashboard not found. Please ensure static/index.html exists."
 
 @app.post("/chat")
-async def chat(request: ChatRequest, token: str = Depends(verify_token)):
-    if not client:
-        raise HTTPException(status_code=500, detail="Gemini Client not initialized")
-    
-    temp_files = []
+async def chat(request: ChatRequest, token: str = Depends(verify_token), db: Session = Depends(get_db)):
+    client = await get_random_client(db)
+    temp_files = await download_files_from_message(request.message, client)
     try:
-        # Detect and download files
-        temp_files = await download_files_from_message(request.message)
-        
-        metadata = None
-        if request.session_id and request.session_id in sessions:
-            metadata = sessions[request.session_id]
-        
+        metadata = sessions.get(request.session_id)
         chat_session = client.start_chat(metadata=metadata)
-        
         final_message = request.message
         if not metadata:
             final_message = f"[SYSTEM INSTRUCTION: {request.system_prompt}]\n\nUser: {request.message}"
-            
-        # Send message with files
-        response = await chat_session.send_message(final_message, files=temp_files if temp_files else None)
         
+        response = await chat_session.send_message(final_message, files=temp_files if temp_files else None)
         if request.session_id:
             sessions[request.session_id] = chat_session.metadata
             
@@ -193,81 +198,39 @@ async def chat(request: ChatRequest, token: str = Depends(verify_token)):
             "conversation_id": chat_session.cid,
             "images": [img.url for img in response.images] if response.images else []
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Cleanup temp files
         for f in temp_files:
             try: os.remove(f)
             except: pass
 
-# --- OpenAI Compatible Endpoint ---
 @app.get("/v1/models")
 async def list_models(token: str = Depends(verify_token)):
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": "salesmanchatbot-ultimate",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "evola"
-            }
-        ]
-    }
+    return {"object": "list", "data": [{"id": "salesmanchatbot-ultimate", "object": "model", "created": int(time.time()), "owned_by": "evola"}]}
 
 @app.post("/v1/chat/completions")
-async def openai_chat(request: OpenAIRequest, token: str = Depends(verify_token)):
-    if not client:
-        raise HTTPException(status_code=500, detail="Gemini Client not initialized")
-    
-    temp_files = []
+async def openai_chat(request: OpenAIRequest, token: str = Depends(verify_token), db: Session = Depends(get_db)):
+    client = await get_random_client(db)
+    system_prompt, user_message, temp_files = await extract_content_and_files(request.messages, client)
     try:
-        # Extract system prompt, user message and download any files/URLs
-        system_prompt, user_message, temp_files = await extract_content_and_files(request.messages)
-        
-        # Use 'user' field as session_id for persistence
         session_id = request.user
         metadata = sessions.get(session_id)
-        
         chat_session = client.start_chat(metadata=metadata)
-        
         final_message = user_message
         if not metadata:
             final_message = f"[SYSTEM INSTRUCTION: {system_prompt}]\n\nUser: {user_message}"
             
-        # Send message with files
         response = await chat_session.send_message(final_message, files=temp_files if temp_files else None)
-        
-        # Save metadata
         sessions[session_id] = chat_session.metadata
         
-        # Format response in OpenAI style
         return {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": request.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": response.text
-                    },
-                    "finish_reason": "stop"
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0
-            }
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": response.text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Cleanup temp files
         for f in temp_files:
             try: os.remove(f)
             except: pass
@@ -278,47 +241,74 @@ async def audio_transcriptions(
     model: str = Form("whisper-1"),
     prompt: Optional[str] = Form(None),
     response_format: Optional[str] = Form("json"),
-    temperature: Optional[float] = Form(0),
-    language: Optional[str] = Form(None),
-    token: str = Depends(verify_token)
+    token: str = Depends(verify_token),
+    db: Session = Depends(get_db)
 ):
-    if not client:
-        raise HTTPException(status_code=500, detail="Gemini Client not initialized")
-    
-    temp_file_path = None
+    client = await get_random_client(db)
+    temp_path = None
     try:
-        # Save the uploaded file to a temporary location
         ext = Path(file.filename).suffix
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-            shutil.copyfileobj(file.file, temp_file)
-            temp_file_path = temp_file.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            temp_path = tmp.name
         
-        # Start a new chat session to process the audio
         chat_session = client.start_chat()
-        
-        # Construct the prompt for transcription
-        transcription_prompt = "Please transcribe this audio file."
-        if prompt:
-            transcription_prompt = f"Please transcribe this audio file with the following context: {prompt}"
-        if language:
-            transcription_prompt += f" The audio is in {language}."
-            
-        # Send the audio file to Gemini
-        response = await chat_session.send_message(transcription_prompt, files=[temp_file_path])
-        
-        # Return the transcription
-        if response_format == "text":
-            return response.text
-        
-        return {"text": response.text}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        p = prompt if prompt else "Please transcribe this audio file."
+        response = await chat_session.send_message(p, files=[temp_path])
+        return response.text if response_format == "text" else {"text": response.text}
     finally:
-        # Cleanup the temporary file
-        if temp_file_path and os.path.exists(temp_file_path):
-            try: os.remove(temp_file_path)
+        if temp_path and os.path.exists(temp_path):
+            try: os.remove(temp_path)
             except: pass
+
+# --- Dashboard ---
+@app.post("/api/login")
+async def login(request: LoginRequest):
+    if request.username == ADMIN_USERNAME and request.password == ADMIN_PASSWORD:
+        return {"status": "success", "token": "admin-session-token"}
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+@app.get("/api/stats")
+async def get_stats(db: Session = Depends(get_db)):
+    return {"total_cookies": db.query(Cookie).count(), "active_cookies": db.query(Cookie).filter(Cookie.status == "alive").count(), "total_keys": db.query(APIKey).count()}
+
+@app.get("/api/cookies")
+async def list_cookies(db: Session = Depends(get_db)):
+    return db.query(Cookie).all()
+
+@app.post("/api/cookies")
+async def add_cookie(data: dict, db: Session = Depends(get_db)):
+    db.add(Cookie(gmail=data["gmail"], secure_1psid=data["secure_1psid"], secure_1psidts=data.get("secure_1psidts")))
+    db.commit()
+    return {"status": "success"}
+
+@app.delete("/api/cookies/{gmail}")
+async def delete_cookie(gmail: str, db: Session = Depends(get_db)):
+    db.query(Cookie).filter(Cookie.gmail == gmail).delete()
+    db.commit()
+    active_clients.pop(gmail, None)
+    return {"status": "success"}
+
+@app.get("/api/keys")
+async def list_keys(db: Session = Depends(get_db)):
+    return db.query(APIKey).all()
+
+@app.post("/api/keys")
+async def create_key(data: dict, db: Session = Depends(get_db)):
+    import secrets
+    k = APIKey(key=f"evola-{secrets.token_hex(16)}", label=data.get("label", "New Key"))
+    db.add(k); db.commit()
+    return {"status": "success", "key": k.key}
+
+@app.delete("/api/keys/{key_id}")
+async def delete_key(key_id: int, db: Session = Depends(get_db)):
+    db.query(APIKey).filter(APIKey.id == key_id).delete()
+    db.commit()
+    return {"status": "success"}
+
+@app.get("/api/logs")
+async def get_logs(db: Session = Depends(get_db)):
+    return db.query(Log).order_by(Log.created_at.desc()).limit(50).all()
 
 if __name__ == "__main__":
     import uvicorn
