@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import os
 import asyncio
@@ -10,7 +11,19 @@ from pathlib import Path
 from gemini_webapi import GeminiClient
 from typing import Optional, List, Dict, Any
 
-app = FastAPI(title="Gemini Web API OpenAI Wrapper")
+app = FastAPI(title="Evola Gemini Web API")
+
+# Security
+security = HTTPBearer()
+API_KEY = os.getenv("API_KEY")
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if API_KEY and credentials.credentials != API_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid or missing API Key"
+        )
+    return credentials.credentials
 
 # Load cookies from environment variables for security
 SECURE_1PSID = os.getenv("SECURE_1PSID")
@@ -149,7 +162,7 @@ async def root():
     return {"status": "running", "message": "Gemini OpenAI-Compatible API is ready"}
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, token: str = Depends(verify_token)):
     if not client:
         raise HTTPException(status_code=500, detail="Gemini Client not initialized")
     
@@ -190,7 +203,7 @@ async def chat(request: ChatRequest):
 
 # --- OpenAI Compatible Endpoint ---
 @app.get("/v1/models")
-async def list_models():
+async def list_models(token: str = Depends(verify_token)):
     return {
         "object": "list",
         "data": [
@@ -198,13 +211,13 @@ async def list_models():
                 "id": "salesmanchatbot-ultimate",
                 "object": "model",
                 "created": int(time.time()),
-                "owned_by": "google"
+                "owned_by": "evola"
             }
         ]
     }
 
 @app.post("/v1/chat/completions")
-async def openai_chat(request: OpenAIRequest):
+async def openai_chat(request: OpenAIRequest, token: str = Depends(verify_token)):
     if not client:
         raise HTTPException(status_code=500, detail="Gemini Client not initialized")
     
@@ -266,7 +279,8 @@ async def audio_transcriptions(
     prompt: Optional[str] = Form(None),
     response_format: Optional[str] = Form("json"),
     temperature: Optional[float] = Form(0),
-    language: Optional[str] = Form(None)
+    language: Optional[str] = Form(None),
+    token: str = Depends(verify_token)
 ):
     if not client:
         raise HTTPException(status_code=500, detail="Gemini Client not initialized")
