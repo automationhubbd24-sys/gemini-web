@@ -2,10 +2,11 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
 import asyncio
+import time
 from gemini_webapi import GeminiClient
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
-app = FastAPI(title="Gemini Web API Wrapper")
+app = FastAPI(title="Gemini Web API OpenAI Wrapper")
 
 # Load cookies from environment variables for security
 SECURE_1PSID = os.getenv("SECURE_1PSID")
@@ -20,6 +21,17 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     system_prompt: Optional[str] = "You are a helpful assistant."
 
+# --- OpenAI Compatible Models ---
+class OpenAIMessage(BaseModel):
+    role: str
+    content: str
+
+class OpenAIRequest(BaseModel):
+    model: str
+    messages: List[OpenAIMessage]
+    temperature: Optional[float] = 0.7
+    user: Optional[str] = "default_user"
+
 @app.on_event("startup")
 async def startup_event():
     global client
@@ -33,7 +45,7 @@ async def startup_event():
 
 @app.get("/")
 async def root():
-    return {"status": "running", "message": "Gemini Web API is ready"}
+    return {"status": "running", "message": "Gemini OpenAI-Compatible API is ready"}
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
@@ -42,21 +54,17 @@ async def chat(request: ChatRequest):
     
     try:
         metadata = None
-        # If session_id is provided, try to load existing metadata
         if request.session_id and request.session_id in sessions:
             metadata = sessions[request.session_id]
         
-        # Start chat session
         chat_session = client.start_chat(metadata=metadata)
         
-        # If it's a new session, prepend system prompt to the first message
         final_message = request.message
         if not metadata:
             final_message = f"[SYSTEM INSTRUCTION: {request.system_prompt}]\n\nUser: {request.message}"
             
         response = await chat_session.send_message(final_message)
         
-        # Save metadata if session_id was provided
         if request.session_id:
             sessions[request.session_id] = chat_session.metadata
             
@@ -65,6 +73,63 @@ async def chat(request: ChatRequest):
             "session_id": request.session_id,
             "conversation_id": chat_session.cid,
             "images": [img.url for img in response.images] if response.images else []
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- OpenAI Compatible Endpoint ---
+@app.post("/v1/chat/completions")
+async def openai_chat(request: OpenAIRequest):
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini Client not initialized")
+    
+    try:
+        # Extract system prompt and last user message
+        system_prompt = "You are a helpful assistant."
+        user_message = ""
+        
+        for msg in request.messages:
+            if msg.role == "system":
+                system_prompt = msg.content
+            elif msg.role == "user":
+                user_message = msg.content
+        
+        # Use 'user' field as session_id for persistence
+        session_id = request.user
+        metadata = sessions.get(session_id)
+        
+        chat_session = client.start_chat(metadata=metadata)
+        
+        final_message = user_message
+        if not metadata:
+            final_message = f"[SYSTEM INSTRUCTION: {system_prompt}]\n\nUser: {user_message}"
+            
+        response = await chat_session.send_message(final_message)
+        
+        # Save metadata
+        sessions[session_id] = chat_session.metadata
+        
+        # Format response in OpenAI style
+        return {
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response.text
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
+            }
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
