@@ -29,6 +29,32 @@ active_clients: Dict[str, tuple[GeminiClient, float]] = {}
 sessions: Dict[str, list] = {}
 client_lock = asyncio.Lock()
 rotation_index = 0
+cookie_cache: List[Cookie] = []
+last_db_refresh = 0
+
+async def warm_up_clients():
+    """Background task to pre-initialize all alive cookies in the pool."""
+    print("Starting background warming of Gemini clients...")
+    while True:
+        try:
+            db = next(get_db())
+            cookies = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").all()
+            for cookie in cookies:
+                if cookie.gmail not in active_clients:
+                    try:
+                        print(f"Pre-initializing client for {cookie.gmail} in background...")
+                        client = GeminiClient(cookie.secure_1psid, cookie.secure_1psidts)
+                        await client.init(timeout=30, auto_refresh=True)
+                        async with client_lock:
+                            active_clients[cookie.gmail] = (client, time.time())
+                        print(f"Successfully warmed up {cookie.gmail}")
+                    except Exception as e:
+                        print(f"Background warming failed for {cookie.gmail}: {e}")
+            db.close()
+        except Exception as e:
+            print(f"Warming loop error: {e}")
+        
+        await asyncio.sleep(600) # Re-check every 10 minutes
 
 # URL Regex to detect links
 URL_REGEX = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+')
@@ -137,32 +163,35 @@ async def extract_content_and_files(messages: List[OpenAIMessage], client: Gemin
 
 async def get_next_client(db: Session) -> GeminiClient:
     """Get the next Gemini client in a Round-Robin fashion (A -> B -> C)."""
-    global active_clients, rotation_index
+    global active_clients, rotation_index, cookie_cache, last_db_refresh
     
-    # 1. Get all alive cookies from DB
-    cookies = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").order_by(Cookie.id).all()
-    if not cookies:
+    # 1. Refresh cookie cache from DB every 60 seconds to avoid constant DB calls
+    current_time = time.time()
+    if not cookie_cache or (current_time - last_db_refresh) > 60:
+        cookie_cache = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").order_by(Cookie.id).all()
+        last_db_refresh = current_time
+        
+    if not cookie_cache:
         raise HTTPException(status_code=503, detail="No active Gemini cookies available")
     
     # 2. Prefer already initialized clients to save time
-    # Check if current rotation index client is already in memory
-    for _ in range(len(cookies)):
-        if rotation_index >= len(cookies):
+    for _ in range(len(cookie_cache)):
+        if rotation_index >= len(cookie_cache):
             rotation_index = 0
         
-        selected_cookie = cookies[rotation_index]
+        selected_cookie = cookie_cache[rotation_index]
         if selected_cookie.gmail in active_clients:
             client, _ = active_clients[selected_cookie.gmail]
-            rotation_index = (rotation_index + 1) % len(cookies)
+            rotation_index = (rotation_index + 1) % len(cookie_cache)
             return client
         
-        rotation_index = (rotation_index + 1) % len(cookies)
+        rotation_index = (rotation_index + 1) % len(cookie_cache)
 
     # 3. If no cached client is found, pick the one at rotation_index and init it
-    if rotation_index >= len(cookies):
+    if rotation_index >= len(cookie_cache):
         rotation_index = 0
-    selected_cookie = cookies[rotation_index]
-    rotation_index = (rotation_index + 1) % len(cookies)
+    selected_cookie = cookie_cache[rotation_index]
+    rotation_index = (rotation_index + 1) % len(cookie_cache)
 
     async with client_lock:
         if selected_cookie.gmail in active_clients:
@@ -170,9 +199,7 @@ async def get_next_client(db: Session) -> GeminiClient:
             return client
             
         try:
-            print(f"Initializing new client for {selected_cookie.gmail}...")
             client = GeminiClient(selected_cookie.secure_1psid, selected_cookie.secure_1psidts)
-            # Minimize init timeout for faster failure detection
             await client.init(timeout=20, auto_refresh=True)
             active_clients[selected_cookie.gmail] = (client, time.time())
             return client
@@ -180,6 +207,7 @@ async def get_next_client(db: Session) -> GeminiClient:
             db.query(Cookie).filter(Cookie.gmail == selected_cookie.gmail).update({"status": "dead"})
             db.add(Log(event_type="error", message=f"Failed to init client: {str(e)}", gmail=selected_cookie.gmail))
             db.commit()
+            cookie_cache = [] # Invalidate cache
             return await get_next_client(db)
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
@@ -192,7 +220,8 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security), 
 @app.on_event("startup")
 async def startup_event():
     init_db()
-    print("Evola Gemini System Started.")
+    asyncio.create_task(warm_up_clients()) # Start background warming
+    print("Evola Gemini System Started with Background Warming.")
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
