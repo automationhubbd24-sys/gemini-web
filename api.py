@@ -24,8 +24,8 @@ security = HTTPBearer()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "evola123")
 
-# In-memory client cache (gmail -> GeminiClient)
-active_clients: Dict[str, GeminiClient] = {}
+# In-memory client cache (gmail -> (GeminiClient, last_used))
+active_clients: Dict[str, tuple[GeminiClient, float]] = {}
 sessions: Dict[str, list] = {}
 client_lock = asyncio.Lock()
 
@@ -137,22 +137,40 @@ async def extract_content_and_files(messages: List[OpenAIMessage], client: Gemin
 async def get_random_client(db: Session) -> GeminiClient:
     """Get a random initialized Gemini client from the active pool in DB."""
     global active_clients
+    
+    # 1. First, check DB for all alive cookies
+    cookies = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").all()
+    if not cookies:
+        raise HTTPException(status_code=503, detail="No active Gemini cookies available")
+    
+    # 2. Prefer clients already in memory to save init time
+    alive_gmails = [c.gmail for c in cookies]
+    cached_alive = [gmail for gmail in active_clients.keys() if gmail in alive_gmails]
+    
+    if cached_alive:
+        selected_gmail = random.choice(cached_alive)
+        client, _ = active_clients[selected_gmail]
+        active_clients[selected_gmail] = (client, time.time())
+        return client
+
+    # 3. If no cached client, pick a random one from DB and init
+    selected_cookie = random.choice(cookies)
+    
     async with client_lock:
-        cookies = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").all()
-        if not cookies:
-            raise HTTPException(status_code=503, detail="No active Gemini cookies available")
-        
-        selected_cookie = random.choice(cookies)
+        # Double check after lock
         if selected_cookie.gmail in active_clients:
-            return active_clients[selected_cookie.gmail]
-        
+            client, _ = active_clients[selected_cookie.gmail]
+            return client
+            
         try:
+            print(f"Initializing new client for {selected_cookie.gmail} (this might take a few seconds)...")
             client = GeminiClient(selected_cookie.secure_1psid, selected_cookie.secure_1psidts)
             await client.init()
-            active_clients[selected_cookie.gmail] = client
+            active_clients[selected_cookie.gmail] = (client, time.time())
             return client
         except Exception as e:
-            selected_cookie.status = "dead"
+            # Mark cookie as dead in DB
+            db.query(Cookie).filter(Cookie.gmail == selected_cookie.gmail).update({"status": "dead"})
             db.add(Log(event_type="error", message=f"Failed to init client: {str(e)}", gmail=selected_cookie.gmail))
             db.commit()
             return await get_random_client(db)
