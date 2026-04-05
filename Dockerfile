@@ -22,7 +22,8 @@ RUN pip install --no-cache-dir \
     uvicorn \
     loguru \
     sqlalchemy \
-    psycopg2-binary
+    psycopg2-binary \
+    python-multipart
 
 # Set PYTHONPATH to include src directory
 ENV PYTHONPATH="/app/src:${PYTHONPATH}"
