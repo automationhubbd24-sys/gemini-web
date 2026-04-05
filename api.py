@@ -84,7 +84,7 @@ async def list_models():
         "object": "list",
         "data": [
             {
-                "id": "gemini-web",
+                "id": "salesmanchatbot-ultimate",
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "google"
