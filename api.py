@@ -78,6 +78,20 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- OpenAI Compatible Endpoint ---
+@app.get("/v1/models")
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "gemini-web",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "google"
+            }
+        ]
+    }
+
 @app.post("/v1/chat/completions")
 async def openai_chat(request: OpenAIRequest):
     if not client:
