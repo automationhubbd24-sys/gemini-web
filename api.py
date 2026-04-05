@@ -1,10 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 import os
 import asyncio
 import time
 import re
 import tempfile
+import shutil
 from pathlib import Path
 from gemini_webapi import GeminiClient
 from typing import Optional, List, Dict, Any
@@ -256,6 +257,53 @@ async def openai_chat(request: OpenAIRequest):
         # Cleanup temp files
         for f in temp_files:
             try: os.remove(f)
+            except: pass
+
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions(
+    file: UploadFile = File(...),
+    model: str = Form("whisper-1"),
+    prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form("json"),
+    temperature: Optional[float] = Form(0),
+    language: Optional[str] = Form(None)
+):
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini Client not initialized")
+    
+    temp_file_path = None
+    try:
+        # Save the uploaded file to a temporary location
+        ext = Path(file.filename).suffix
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
+            shutil.copyfileobj(file.file, temp_file)
+            temp_file_path = temp_file.name
+        
+        # Start a new chat session to process the audio
+        chat_session = client.start_chat()
+        
+        # Construct the prompt for transcription
+        transcription_prompt = "Please transcribe this audio file."
+        if prompt:
+            transcription_prompt = f"Please transcribe this audio file with the following context: {prompt}"
+        if language:
+            transcription_prompt += f" The audio is in {language}."
+            
+        # Send the audio file to Gemini
+        response = await chat_session.send_message(transcription_prompt, files=[temp_file_path])
+        
+        # Return the transcription
+        if response_format == "text":
+            return response.text
+        
+        return {"text": response.text}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Cleanup the temporary file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try: os.remove(temp_file_path)
             except: pass
 
 if __name__ == "__main__":
