@@ -128,9 +128,9 @@ async def download_files_from_message(message: str, client: GeminiClient = None)
     return temp_files
 
 async def extract_content_and_files(messages: List[OpenAIMessage], client: GeminiClient = None) -> tuple[str, str, List[str]]:
-    """Extract system prompt, full conversation history and any file URLs from OpenAI messages."""
-    system_prompt = "You are a helpful assistant."
-    history = []
+    """Expertly extract system prompt and rebuild the entire conversation transcript for stable memory."""
+    system_prompt = "You are a helpful AI assistant."
+    transcript = []
     file_urls = []
     
     for msg in messages:
@@ -154,22 +154,18 @@ async def extract_content_and_files(messages: List[OpenAIMessage], client: Gemin
                     elif item.get("type") == "image_url":
                         url = item.get("image_url", {}).get("url", "")
                         if url: file_urls.append(url)
-                    elif item.get("type") == "file_url":
-                        url = item.get("file_url", {}).get("url", "")
-                        if url: file_urls.append(url)
-            history.append(f"User: {text.strip()}")
+            transcript.append(f"User: {text.strip()}")
             
         elif msg.role == "assistant":
-            if isinstance(msg.content, str):
-                history.append(f"Assistant: {msg.content}")
-            # Support for simulated tool calls in history
+            if msg.content:
+                transcript.append(f"Assistant: {msg.content}")
             if msg.tool_calls:
                 for tc in msg.tool_calls:
                     f = tc.get("function", {})
-                    history.append(f"Assistant Tool Call: {f.get('name')}({f.get('arguments')})")
+                    transcript.append(f"Assistant Tool Call: {f.get('name')}({f.get('arguments')})")
                     
         elif msg.role == "tool":
-            history.append(f"[TOOL_RESULT (ID: {msg.tool_call_id}): {msg.content}]")
+            transcript.append(f"[TOOL_RESULT (ID: {msg.tool_call_id}): {msg.content}]")
     
     temp_files = []
     unique_urls = list(dict.fromkeys(file_urls))
@@ -179,26 +175,23 @@ async def extract_content_and_files(messages: List[OpenAIMessage], client: Gemin
             temp_files.extend(files)
         except: pass
             
-    return system_prompt, "\n".join(history).strip(), temp_files
+    return system_prompt, "\n".join(transcript).strip(), temp_files
 
 def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
-    """Format tools list into a system instruction for Gemini."""
+    """Enhanced tool instruction for Gemini 3 Thinking model."""
     if not tools:
         return ""
     
-    instruction = "\n\n[SYSTEM_NOTE: AGENT_MODE_ACTIVE]\n"
-    instruction += "You are an AI Agent equipped with external tools. You MUST follow these rules strictly:\n"
-    instruction += "1. If you need to use a tool to provide an accurate answer, you MUST NOT output a conversational response. Instead, you MUST output ONLY a JSON code block in the following format:\n"
-    instruction += "```json\n{\"tool_call\": {\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}, \"id\": \"call_abc123\"}}\n```\n"
-    instruction += "2. DO NOT explain your reasoning before the JSON block.\n"
-    instruction += "3. DO NOT output any text other than the JSON block when calling a tool.\n"
-    instruction += "4. Use tools for any search, information gathering, or computation.\n\n"
-    instruction += "Available Tools List:\n"
+    instruction = "\n\n[SYSTEM_PROTOCOL: AGENT_MODE_ACTIVE]\n"
+    instruction += "You are an advanced AI Agent. To fulfill the user's request, you MUST use the provided tools if necessary.\n"
+    instruction += "RULES:\n"
+    instruction += "1. If a tool is needed, output ONLY a JSON block and NOTHING ELSE. No preamble, no explanation.\n"
+    instruction += "2. Format: ```json\n{\"tool_call\": {\"name\": \"function_name\", \"arguments\": {...}, \"id\": \"call_unique_id\"}}\n```\n"
+    instruction += "3. After you receive a [TOOL_RESULT], use that information to provide your final answer to the user.\n\n"
+    instruction += "Available Tools:\n"
     for tool in tools:
         f = tool.get("function", {})
-        instruction += f"- Name: {f.get('name')}\n"
-        instruction += f"  Description: {f.get('description')}\n"
-        instruction += f"  Parameters: {json.dumps(f.get('parameters', {}))}\n\n"
+        instruction += f"- {f.get('name')}: {f.get('description')}. Args: {json.dumps(f.get('parameters', {}))}\n"
     
     return instruction
 
@@ -359,31 +352,23 @@ async def openai_chat(request: OpenAIRequest, token: str = Depends(verify_token)
     try:
         session_id = request.user
         metadata = sessions.get(session_id)
-        chat_session = client.start_chat(metadata=metadata, model=gemini_model)
+        # Expert Memory Strategy:
+        # Instead of relying on Google's internal memory, we always send the full 
+        # conversation transcript to ensure consistent context and tool-use performance.
+        # We start a NEW chat every time to keep it stateless and predictable.
         
-        # If metadata exists, Gemini already has history. We only send the latest turn.
-        # But if there are tool results, they must be sent.
-        if metadata:
-            # Get the last message's content
-            last_msg = request.messages[-1]
-            last_text = ""
-            if last_msg.role == "user":
-                if isinstance(last_msg.content, str): last_text = last_msg.content
-                elif isinstance(last_msg.content, list): 
-                    last_text = " ".join([item.get("text", "") for item in last_msg.content if item.get("type") == "text"])
-            elif last_msg.role == "tool":
-                last_text = f"[TOOL_RESULT (ID: {last_msg.tool_call_id}): {last_msg.content}]"
-            
-            final_message = last_text
-            if tools_instruction:
-                final_message = f"{last_text}\n\n[SYSTEM_REMINDER: {tools_instruction}]"
-        else:
-            # New session: send the full history to prime the memory
-            final_message = f"[SYSTEM_PROMPT: {system_prompt}]\n\n{full_history}"
-            if tools_instruction:
-                final_message += tools_instruction
+        chat_session = client.start_chat(model=gemini_model)
+        
+        final_message = f"[SYSTEM_PROMPT: {system_prompt}]\n\n[CONVERSATION_TRANSCRIPT]\n{full_history}"
+        if tools_instruction:
+            final_message += f"\n\n{tools_instruction}"
+        
+        # Add a hint for the model to continue the conversation
+        final_message += "\n\nAssistant:"
 
         response = await chat_session.send_message(final_message, files=temp_files if temp_files else None)
+        
+        # We still save metadata for logging, but we don't strictly need it for next turn
         sessions[session_id] = chat_session.metadata
         
         # Check for tool calls in the response
