@@ -19,14 +19,14 @@ from typing import Optional, List, Dict, Any
 from database import init_db, get_db, APIKey, Cookie, Log
 from sqlalchemy.orm import Session
 
-app = FastAPI(title="Evola Gemini Web API")
+app = FastAPI(title="Evola Gemini AI Studio Proxy")
 
 # Security
 security = HTTPBearer()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "evola123")
 
-# In-memory client cache (gmail -> (GeminiClient, last_used))
+# In-memory client cache
 active_clients: Dict[str, tuple[GeminiClient, float]] = {}
 sessions: Dict[str, list] = {}
 client_lock = asyncio.Lock()
@@ -35,7 +35,7 @@ cookie_cache: List[Cookie] = []
 last_db_refresh = 0
 
 async def warm_up_clients():
-    """Background task to pre-initialize all alive cookies in the pool."""
+    """Background task to pre-initialize all alive cookies."""
     print("Starting background warming of Gemini clients...")
     while True:
         try:
@@ -44,32 +44,21 @@ async def warm_up_clients():
             for cookie in cookies:
                 if cookie.gmail not in active_clients:
                     try:
-                        print(f"Pre-initializing client for {cookie.gmail} in background...")
                         client = GeminiClient(cookie.secure_1psid, cookie.secure_1psidts)
                         await client.init(timeout=30, auto_refresh=True)
                         async with client_lock:
                             active_clients[cookie.gmail] = (client, time.time())
-                        print(f"Successfully warmed up {cookie.gmail}")
-                    except Exception as e:
-                        print(f"Background warming failed for {cookie.gmail}: {e}")
+                    except Exception: pass
             db.close()
-        except Exception as e:
-            print(f"Warming loop error: {e}")
-        
-        await asyncio.sleep(600) # Re-check every 10 minutes
+        except Exception: pass
+        await asyncio.sleep(600)
 
-# URL Regex to detect links
 URL_REGEX = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+')
 
-# --- Models ---
-class ChatRequest(BaseModel):
-    message: str
-    session_id: Optional[str] = None
-    system_prompt: Optional[str] = "You are a helpful assistant."
-
+# --- OpenAI Compatible Models ---
 class OpenAIMessage(BaseModel):
     role: str
-    content: Any  # Can be string or list for multimodal
+    content: Any
     tool_call_id: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
 
@@ -81,393 +70,156 @@ class OpenAIRequest(BaseModel):
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Any] = None
 
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
 # --- Helpers ---
 async def download_files_from_message(message: str, client: GeminiClient = None) -> List[str]:
-    """Detect and download files from a message, returns list of local temp file paths."""
     urls = URL_REGEX.findall(message)
     temp_files = []
-    
-    if not urls:
-        return []
-        
+    if not urls: return []
     for url in urls:
         try:
-            # We use GeminiClient's session if available, otherwise create a temporary one
             session = client.client if client else None
             if not session:
                 from curl_cffi.requests import AsyncSession
                 session = AsyncSession()
-            
             response = await session.get(url, timeout=30)
             if response.status_code == 200:
-                content_type = response.headers.get("content-type", "")
                 ext = ".bin"
-                if "image/png" in content_type: ext = ".png"
-                elif "image/jpeg" in content_type: ext = ".jpg"
-                elif "image/webp" in content_type: ext = ".webp"
-                elif "audio/mpeg" in content_type or "audio/mp3" in content_type: ext = ".mp3"
-                elif "audio/ogg" in content_type: ext = ".ogg"
-                elif "audio/wav" in content_type: ext = ".wav"
-                elif "video/mp4" in content_type: ext = ".mp4"
-                elif "application/pdf" in content_type: ext = ".pdf"
-                else:
-                    url_ext = Path(url.split("?")[0]).suffix
-                    if url_ext: ext = url_ext
-
+                ct = response.headers.get("content-type", "")
+                if "image" in ct: ext = ".png"
+                elif "pdf" in ct: ext = ".pdf"
                 fd, temp_path = tempfile.mkstemp(suffix=ext)
-                with os.fdopen(fd, 'wb') as f:
-                    f.write(response.content)
+                with os.fdopen(fd, 'wb') as f: f.write(response.content)
                 temp_files.append(temp_path)
-        except Exception as e:
-            print(f"Failed to download {url}: {e}")
-            
+        except: pass
     return temp_files
 
-async def extract_content_and_files(messages: List[OpenAIMessage], client: GeminiClient = None) -> tuple[str, str, List[str]]:
-    """Expertly extract system prompt and rebuild the entire conversation transcript for stable memory."""
-    system_prompt = "You are a helpful AI assistant."
-    transcript = []
-    file_urls = []
-    
-    for msg in messages:
-        if msg.role == "system":
-            if isinstance(msg.content, str):
-                system_prompt = msg.content
-            elif isinstance(msg.content, list):
-                system_prompt = " ".join([item.get("text", "") for item in msg.content if item.get("type") == "text"])
-        
-        elif msg.role == "user":
-            text = ""
-            if isinstance(msg.content, str):
-                text = msg.content
-                file_urls.extend(URL_REGEX.findall(msg.content))
-            elif isinstance(msg.content, list):
-                for item in msg.content:
-                    if item.get("type") == "text":
-                        t = item.get("text", "")
-                        text += t + " "
-                        file_urls.extend(URL_REGEX.findall(t))
-                    elif item.get("type") == "image_url":
-                        url = item.get("image_url", {}).get("url", "")
-                        if url: file_urls.append(url)
-            transcript.append(f"User: {text.strip()}")
-            
-        elif msg.role == "assistant":
-            if msg.content:
-                transcript.append(f"Assistant: {msg.content}")
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    f = tc.get("function", {})
-                    transcript.append(f"Assistant Tool Call: {f.get('name')}({f.get('arguments')})")
-                    
-        elif msg.role == "tool":
-            transcript.append(f"[TOOL_RESULT (ID: {msg.tool_call_id}): {msg.content}]")
-    
-    temp_files = []
-    unique_urls = list(dict.fromkeys(file_urls))
-    for url in unique_urls:
-        try:
-            files = await download_files_from_message(url, client)
-            temp_files.extend(files)
-        except: pass
-            
-    return system_prompt, "\n".join(transcript).strip(), temp_files
-
-def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
-    """Enhanced tool instruction for Gemini 3 Thinking model."""
-    if not tools:
-        return ""
-    
+def format_tools_as_instruction(tools: List[Dict[str, Any]]) -> str:
+    """Simulate native function calling behavior via advanced prompting."""
+    if not tools: return ""
     instruction = "\n\n[SYSTEM_PROTOCOL: AGENT_MODE_ACTIVE]\n"
-    instruction += "You are an advanced AI Agent. To fulfill the user's request, you MUST use the provided tools if necessary.\n"
-    instruction += "RULES:\n"
-    instruction += "1. If a tool is needed, output ONLY a JSON block and NOTHING ELSE. No preamble, no explanation.\n"
-    instruction += "2. Format: ```json\n{\"tool_call\": {\"name\": \"function_name\", \"arguments\": {...}, \"id\": \"call_unique_id\"}}\n```\n"
-    instruction += "3. After you receive a [TOOL_RESULT], use that information to provide your final answer to the user.\n\n"
+    instruction += "You are an advanced AI Agent. Use tools by outputting ONLY a JSON block:\n"
+    instruction += "```json\n{\"tool_call\": {\"name\": \"fn_name\", \"arguments\": {...}}}\n```\n"
     instruction += "Available Tools:\n"
     for tool in tools:
         f = tool.get("function", {})
-        instruction += f"- {f.get('name')}: {f.get('description')}. Args: {json.dumps(f.get('parameters', {}))}\n"
-    
+        instruction += f"- {f.get('name')}: {f.get('description')}. Schema: {json.dumps(f.get('parameters', {}))}\n"
     return instruction
 
-def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
-    """Detect and parse tool calls from Gemini's text output."""
-    tool_calls = []
-    # Look for JSON blocks or raw JSON containing "tool_call"
-    json_pattern = re.compile(r'```json\s*(\{.*?\})\s*```|(\{.*?"tool_call".*?\})', re.DOTALL)
-    matches = json_pattern.findall(text)
-    
-    for match in matches:
-        json_str = match[0] or match[1]
-        try:
-            data = json.loads(json_str)
-            if "tool_call" in data:
-                tc = data["tool_call"]
-                tool_calls.append({
-                    "id": tc.get("id", f"call_{secrets.token_hex(4)}"),
-                    "type": "function",
-                    "function": {
-                        "name": tc.get("name"),
-                        "arguments": json.dumps(tc.get("arguments", {}))
-                    }
-                })
-        except:
-            continue
-            
-    return tool_calls
+async def extract_transcript(messages: List[OpenAIMessage]) -> tuple[str, str]:
+    """Extract system instruction and rebuild conversation for AI Studio behavior."""
+    sys_inst = "You are a helpful AI assistant."
+    transcript = []
+    for msg in messages:
+        if msg.role == "system":
+            sys_inst = msg.content if isinstance(msg.content, str) else str(msg.content)
+        elif msg.role == "user":
+            transcript.append(f"User: {msg.content}")
+        elif msg.role == "assistant":
+            transcript.append(f"Assistant: {msg.content}")
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    transcript.append(f"Tool Call: {tc['function']['name']}({tc['function']['arguments']})")
+        elif msg.role == "tool":
+            transcript.append(f"Tool Response: {msg.content}")
+    return sys_inst, "\n".join(transcript)
 
 async def get_next_client(db: Session) -> GeminiClient:
-    """Get the next Gemini client in a Round-Robin fashion (A -> B -> C)."""
     global active_clients, rotation_index, cookie_cache, last_db_refresh
+    curr = time.time()
+    if not cookie_cache or (curr - last_db_refresh) > 60:
+        cookie_cache = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").all()
+        last_db_refresh = curr
+    if not cookie_cache: raise HTTPException(status_code=503, detail="No active cookies")
     
-    # 1. Refresh cookie cache from DB every 60 seconds to avoid constant DB calls
-    current_time = time.time()
-    if not cookie_cache or (current_time - last_db_refresh) > 60:
-        cookie_cache = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").order_by(Cookie.id).all()
-        last_db_refresh = current_time
-        
-    if not cookie_cache:
-        raise HTTPException(status_code=503, detail="No active Gemini cookies available")
+    selected = cookie_cache[rotation_index % len(cookie_cache)]
+    rotation_index += 1
+    if selected.gmail in active_clients: return active_clients[selected.gmail][0]
     
-    # 2. Prefer already initialized clients to save time
-    for _ in range(len(cookie_cache)):
-        if rotation_index >= len(cookie_cache):
-            rotation_index = 0
-        
-        selected_cookie = cookie_cache[rotation_index]
-        if selected_cookie.gmail in active_clients:
-            client, _ = active_clients[selected_cookie.gmail]
-            rotation_index = (rotation_index + 1) % len(cookie_cache)
-            return client
-        
-        rotation_index = (rotation_index + 1) % len(cookie_cache)
-
-    # 3. If no cached client is found, pick the one at rotation_index and init it
-    if rotation_index >= len(cookie_cache):
-        rotation_index = 0
-    selected_cookie = cookie_cache[rotation_index]
-    rotation_index = (rotation_index + 1) % len(cookie_cache)
-
     async with client_lock:
-        if selected_cookie.gmail in active_clients:
-            client, _ = active_clients[selected_cookie.gmail]
-            return client
-            
-        try:
-            client = GeminiClient(selected_cookie.secure_1psid, selected_cookie.secure_1psidts)
-            await client.init(timeout=20, auto_refresh=True)
-            active_clients[selected_cookie.gmail] = (client, time.time())
-            return client
-        except Exception as e:
-            db.query(Cookie).filter(Cookie.gmail == selected_cookie.gmail).update({"status": "dead"})
-            db.add(Log(event_type="error", message=f"Failed to init client: {str(e)}", gmail=selected_cookie.gmail))
-            db.commit()
-            cookie_cache = [] # Invalidate cache
-            return await get_next_client(db)
+        client = GeminiClient(selected.secure_1psid, selected.secure_1psidts)
+        await client.init(timeout=20, auto_refresh=True)
+        active_clients[selected.gmail] = (client, time.time())
+        return client
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
-    key_entry = db.query(APIKey).filter(APIKey.key == credentials.credentials, APIKey.is_active == True).first()
-    if not key_entry:
-        raise HTTPException(status_code=403, detail="Invalid or missing API Key")
+    key = db.query(APIKey).filter(APIKey.key == credentials.credentials, APIKey.is_active == True).first()
+    if not key: raise HTTPException(status_code=403, detail="Invalid API Key")
     return credentials.credentials
 
-# --- Routes ---
-@app.on_event("startup")
-async def startup_event():
-    init_db()
-    asyncio.create_task(warm_up_clients()) # Start background warming
-    print("Evola Gemini System Started with Background Warming.")
-
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    try:
-        with open("static/index.html", "r", encoding="utf-8") as f:
-            return f.read()
-    except:
-        return "Evola Dashboard not found. Please ensure static/index.html exists."
-
-@app.post("/chat")
-async def chat(request: ChatRequest, token: str = Depends(verify_token), db: Session = Depends(get_db)):
+# --- Main API Endpoints ---
+@app.post("/v1/chat/completions")
+async def chat_completions(request: OpenAIRequest, token: str = Depends(verify_token), db: Session = Depends(get_db)):
     client = await get_next_client(db)
-    temp_files = await download_files_from_message(request.message, client)
+    system_instruction, full_history = await extract_transcript(request.messages)
+    tools_instruction = format_tools_as_instruction(request.tools)
+    
+    # Map AI Studio models to Gemini Web Models
+    model_map = {
+        "gemini-2.0-flash-thinking": "gemini-3-flash-thinking",
+        "gemini-2.0-flash": "gemini-3-flash",
+        "gemini-1.5-pro": "gemini-3-pro",
+        "gemini-1.5-flash": "gemini-3-flash"
+    }
+    target_model = model_map.get(request.model.lower(), "gemini-3-flash")
+    
+    # Build AI Studio like Prompt
+    final_prompt = f"[SYSTEM_INSTRUCTION]\n{system_instruction}\n\n"
+    final_prompt += f"[CONVERSATION_HISTORY]\n{full_history}\n\n"
+    if tools_instruction: final_prompt += tools_instruction
+    final_prompt += "\nAssistant:"
+
     try:
-        metadata = sessions.get(request.session_id)
-        chat_session = client.start_chat(metadata=metadata)
-        final_message = request.message
-        if not metadata:
-            final_message = f"[SYSTEM INSTRUCTION: {request.system_prompt}]\n\nUser: {request.message}"
+        # Using RPC for speed (Under the hood)
+        chat = client.start_chat(model=target_model)
+        response = await chat.send_message(final_prompt)
         
-        response = await chat_session.send_message(final_message, files=temp_files if temp_files else None)
-        if request.session_id:
-            sessions[request.session_id] = chat_session.metadata
-            
-        return {
-            "text": response.text,
-            "session_id": request.session_id,
-            "conversation_id": chat_session.cid,
-            "images": [img.url for img in response.images] if response.images else []
-        }
-    finally:
-        for f in temp_files:
-            try: os.remove(f)
+        # Parse for simulated tool calls
+        tool_calls = []
+        json_match = re.search(r'```json\s*({.*?})\s*```', response.text, re.DOTALL)
+        if json_match:
+            try:
+                data = json.loads(json_match.group(1))
+                if "tool_call" in data:
+                    tc = data["tool_call"]
+                    tool_calls.append({
+                        "id": f"call_{secrets.token_hex(4)}",
+                        "type": "function",
+                        "function": {"name": tc.get("name"), "arguments": json.dumps(tc.get("arguments", {}))}
+                    })
             except: pass
 
-@app.get("/v1/models")
-async def list_models(token: str = Depends(verify_token)):
-    models = [
-        {"id": "gemini-3-flash-thinking", "object": "model", "created": int(time.time()), "owned_by": "google"},
-        {"id": "gemini-3-pro", "object": "model", "created": int(time.time()), "owned_by": "google"},
-        {"id": "gemini-3-flash", "object": "model", "created": int(time.time()), "owned_by": "google"},
-        {"id": "salesmanchatbot-ultimate", "object": "model", "created": int(time.time()), "owned_by": "evola"}
-    ]
-    return {"object": "list", "data": models}
-
-@app.post("/v1/chat/completions")
-async def openai_chat(request: OpenAIRequest, token: str = Depends(verify_token), db: Session = Depends(get_db)):
-    client = await get_next_client(db)
-    system_prompt, full_history, temp_files = await extract_content_and_files(request.messages, client)
-    
-    # Map model to Gemini 3
-    model_lower = request.model.lower()
-    if "thinking" in model_lower:
-        gemini_model = "gemini-3-flash-thinking"
-    elif "pro" in model_lower:
-        gemini_model = "gemini-3-pro"
-    elif "flash" in model_lower:
-        gemini_model = "gemini-3-flash"
-    elif "3" in model_lower:
-        gemini_model = "gemini-3-flash"
-    else:
-        # Default for tool use is thinking model as it's much better at it
-        gemini_model = "gemini-3-flash-thinking" if request.tools else "unspecified"
-
-    # Add tools instruction if tools are provided
-    tools_instruction = format_tools_instruction(request.tools)
-    
-    try:
-        session_id = request.user
-        metadata = sessions.get(session_id)
-        # Expert Memory Strategy:
-        # Instead of relying on Google's internal memory, we always send the full 
-        # conversation transcript to ensure consistent context and tool-use performance.
-        # We start a NEW chat every time to keep it stateless and predictable.
-        
-        chat_session = client.start_chat(model=gemini_model)
-        
-        final_message = f"[SYSTEM_PROMPT: {system_prompt}]\n\n[CONVERSATION_TRANSCRIPT]\n{full_history}"
-        if tools_instruction:
-            final_message += f"\n\n{tools_instruction}"
-        
-        # Add a hint for the model to continue the conversation
-        final_message += "\n\nAssistant:"
-
-        response = await chat_session.send_message(final_message, files=temp_files if temp_files else None)
-        
-        # We still save metadata for logging, but we don't strictly need it for next turn
-        sessions[session_id] = chat_session.metadata
-        
-        # Check for tool calls in the response
-        tool_calls = parse_tool_calls(response.text)
-        
-        message_out = {"role": "assistant", "content": response.text}
-        finish_reason = "stop"
-        
-        if tool_calls:
-            message_out["tool_calls"] = tool_calls
-            finish_reason = "tool_calls"
-        
         return {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": request.model,
-            "choices": [{"index": 0, "message": message_out, "finish_reason": finish_reason}],
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": response.text,
+                    "tool_calls": tool_calls if tool_calls else None
+                },
+                "finish_reason": "tool_calls" if tool_calls else "stop"
+            }],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         }
-    finally:
-        for f in temp_files:
-            try: os.remove(f)
-            except: pass
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/v1/audio/transcriptions")
-async def audio_transcriptions(
-    file: UploadFile = File(...),
-    model: str = Form("whisper-1"),
-    prompt: Optional[str] = Form(None),
-    response_format: Optional[str] = Form("json"),
-    token: str = Depends(verify_token),
-    db: Session = Depends(get_db)
-):
-    client = await get_next_client(db)
-    temp_path = None
-    try:
-        ext = Path(file.filename).suffix
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            shutil.copyfileobj(file.file, tmp)
-            temp_path = tmp.name
-        
-        chat_session = client.start_chat()
-        p = prompt if prompt else "Please transcribe this audio file."
-        response = await chat_session.send_message(p, files=[temp_path])
-        return response.text if response_format == "text" else {"text": response.text}
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try: os.remove(temp_path)
-            except: pass
+@app.on_event("startup")
+async def startup():
+    init_db()
+    asyncio.create_task(warm_up_clients())
 
-# --- Dashboard ---
-@app.post("/api/login")
-async def login(request: LoginRequest):
-    if request.username == ADMIN_USERNAME and request.password == ADMIN_PASSWORD:
-        return {"status": "success", "token": "admin-session-token"}
-    raise HTTPException(status_code=401, detail="Invalid credentials")
-
-@app.get("/api/stats")
-async def get_stats(db: Session = Depends(get_db)):
-    return {"total_cookies": db.query(Cookie).count(), "active_cookies": db.query(Cookie).filter(Cookie.status == "alive").count(), "total_keys": db.query(APIKey).count()}
-
-@app.get("/api/cookies")
-async def list_cookies(db: Session = Depends(get_db)):
-    return db.query(Cookie).all()
-
-@app.post("/api/cookies")
-async def add_cookie(data: dict, db: Session = Depends(get_db)):
-    db.add(Cookie(gmail=data["gmail"], secure_1psid=data["secure_1psid"], secure_1psidts=data.get("secure_1psidts")))
-    db.commit()
-    return {"status": "success"}
-
-@app.delete("/api/cookies/{gmail}")
-async def delete_cookie(gmail: str, db: Session = Depends(get_db)):
-    db.query(Cookie).filter(Cookie.gmail == gmail).delete()
-    db.commit()
-    active_clients.pop(gmail, None)
-    return {"status": "success"}
-
-@app.get("/api/keys")
-async def list_keys(db: Session = Depends(get_db)):
-    return db.query(APIKey).all()
-
-@app.post("/api/keys")
-async def create_key(data: dict, db: Session = Depends(get_db)):
-    import secrets
-    k = APIKey(key=f"evola-{secrets.token_hex(16)}", label=data.get("label", "New Key"))
-    db.add(k); db.commit()
-    return {"status": "success", "key": k.key}
-
-@app.delete("/api/keys/{key_id}")
-async def delete_key(key_id: int, db: Session = Depends(get_db)):
-    db.query(APIKey).filter(APIKey.id == key_id).delete()
-    db.commit()
-    return {"status": "success"}
-
-@app.get("/api/logs")
-async def get_logs(db: Session = Depends(get_db)):
-    return db.query(Log).order_by(Log.created_at.desc()).limit(50).all()
+@app.get("/v1/models")
+async def list_models():
+    return {"object": "list", "data": [
+        {"id": "gemini-2.0-flash-thinking", "owned_by": "google"},
+        {"id": "gemini-2.0-flash", "owned_by": "google"},
+        {"id": "gemini-1.5-pro", "owned_by": "google"},
+        {"id": "gemini-1.5-flash", "owned_by": "google"}
+    ]}
 
 if __name__ == "__main__":
     import uvicorn
