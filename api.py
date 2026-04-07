@@ -153,24 +153,25 @@ async def chat_completions(request: OpenAIRequest, token: str = Depends(verify_t
     system_instruction, full_history = await extract_transcript(request.messages)
     tools_instruction = format_tools_as_instruction(request.tools)
     
-    # Map AI Studio models to Gemini Web Models
+    # Pure AI Studio Native Mapping
     model_map = {
         "gemini-3-flash-thinking": "gemini-3-flash-thinking",
         "gemini-3-pro": "gemini-3-pro",
         "gemini-3-flash": "gemini-3-flash",
-        "gemini-2.5-flash": "gemini-3-flash",
-        "gemini-2.0-flash-thinking": "gemini-3-flash-thinking",
-        "gemini-2.0-flash": "gemini-3-flash",
-        "gemini-1.5-pro": "gemini-3-pro",
-        "gemini-1.5-flash": "gemini-3-flash"
+        "gemini-2.0-flash-thinking": "gemini-2.0-flash-thinking-exp",
+        "gemini-2.0-flash": "gemini-2.0-flash-exp",
+        "gemini-1.5-pro": "gemini-1.5-pro",
+        "gemini-1.5-flash": "gemini-1.5-flash",
+        "gemini-2.5-flash": "gemini-2.5-flash-exp" # Placeholder for future
     }
-    target_model = model_map.get(request.model.lower(), "gemini-3-flash")
+    target_model = model_map.get(request.model.lower(), "gemini-2.0-flash-exp")
     
-    # Build AI Studio like Prompt
-    final_prompt = f"[SYSTEM_INSTRUCTION]\n{system_instruction}\n\n"
-    final_prompt += f"[CONVERSATION_HISTORY]\n{full_history}\n\n"
-    if tools_instruction: final_prompt += tools_instruction
-    final_prompt += "\nAssistant:"
+    # Enhanced AI Studio Context Builder
+    final_prompt = f"[NATIVE_SYSTEM_INSTRUCTION]\n{system_instruction}\n\n"
+    final_prompt += f"[NATIVE_CONVERSATION_HISTORY]\n{full_history}\n\n"
+    if tools_instruction: 
+        final_prompt += f"[FUNCTION_CALLING_PROTOCOL_ACTIVE]\n{tools_instruction}"
+    final_prompt += "\n[RESPONSE_TARGET: AI_STUDIO_BEHAVIOR]\nAssistant:"
 
     try:
         # Using RPC for speed (Under the hood)
