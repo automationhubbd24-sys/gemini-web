@@ -207,6 +207,20 @@ async def chat_completions(request: OpenAIRequest, token: str = Depends(verify_t
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- Dashboard ---
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    try:
+        static_path = Path("static/index.html")
+        if static_path.exists():
+            with open(static_path, "r", encoding="utf-8") as f:
+                return f.read()
+        return "Evola Dashboard not found. Please ensure static/index.html exists."
+    except Exception as e:
+        return f"Error loading dashboard: {str(e)}"
+
 @app.on_event("startup")
 async def startup():
     init_db()
