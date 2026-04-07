@@ -1563,26 +1563,15 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
     async def _batch_execute(
         self,
         payloads: list[RPCData],
-        source_path: str = "/app",
+        source_path: str = None,
         close_on_error: bool = True,
         **kwargs,
     ) -> Response:
         """
-        Execute a batch of requests to Gemini API.
-
-        Parameters
-        ----------
-        payloads: `list[RPCData]`
-            List of `gemini_webapi.types.RPCData` objects to be executed.
-        kwargs: `dict`, optional
-            Additional arguments which will be passed to the post request.
-            Refer to `curl_cffi.requests.AsyncSession.request` for more information.
-
-        Returns
-        -------
-        :class:`curl_cffi.requests.Response`
-            Response object containing the result of the batch execution.
+        Execute a batch of requests to Gemini or AI Studio API.
         """
+        if source_path is None:
+            source_path = "/app" if not self.is_aistudio else "/"
 
         _reqid = self._reqid
         self._reqid += 100000
