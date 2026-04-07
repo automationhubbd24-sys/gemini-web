@@ -225,6 +225,62 @@ async def root():
     except Exception as e:
         return f"Error loading dashboard: {str(e)}"
 
+# --- Dashboard API ---
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+@app.post("/api/login")
+async def login(request: LoginRequest):
+    if request.username == ADMIN_USERNAME and request.password == ADMIN_PASSWORD:
+        return {"status": "success", "token": "admin-session-token"}
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+@app.get("/api/stats")
+async def get_stats(db: Session = Depends(get_db)):
+    return {
+        "total_cookies": db.query(Cookie).count(),
+        "active_cookies": db.query(Cookie).filter(Cookie.status == "alive").count(),
+        "total_keys": db.query(APIKey).count()
+    }
+
+@app.get("/api/cookies")
+async def list_cookies(db: Session = Depends(get_db)):
+    return db.query(Cookie).all()
+
+@app.post("/api/cookies")
+async def add_cookie(data: dict, db: Session = Depends(get_db)):
+    db.add(Cookie(gmail=data["gmail"], secure_1psid=data["secure_1psid"], secure_1psidts=data.get("secure_1psidts")))
+    db.commit()
+    return {"status": "success"}
+
+@app.delete("/api/cookies/{gmail}")
+async def delete_cookie(gmail: str, db: Session = Depends(get_db)):
+    db.query(Cookie).filter(Cookie.gmail == gmail).delete()
+    db.commit()
+    active_clients.pop(gmail, None)
+    return {"status": "success"}
+
+@app.get("/api/keys")
+async def list_keys(db: Session = Depends(get_db)):
+    return db.query(APIKey).all()
+
+@app.post("/api/keys")
+async def create_key(data: dict, db: Session = Depends(get_db)):
+    k = APIKey(key=f"evola-{secrets.token_hex(16)}", label=data.get("label", "New Key"))
+    db.add(k); db.commit()
+    return {"status": "success", "key": k.key}
+
+@app.delete("/api/keys/{key_id}")
+async def delete_key(key_id: int, db: Session = Depends(get_db)):
+    db.query(APIKey).filter(APIKey.id == key_id).delete()
+    db.commit()
+    return {"status": "success"}
+
+@app.get("/api/logs")
+async def get_logs(db: Session = Depends(get_db)):
+    return db.query(Log).order_by(Log.created_at.desc()).limit(50).all()
+
 @app.on_event("startup")
 async def startup():
     init_db()
