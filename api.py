@@ -155,6 +155,10 @@ async def chat_completions(request: OpenAIRequest, token: str = Depends(verify_t
     
     # Map AI Studio models to Gemini Web Models
     model_map = {
+        "gemini-3-flash-thinking": "gemini-3-flash-thinking",
+        "gemini-3-pro": "gemini-3-pro",
+        "gemini-3-flash": "gemini-3-flash",
+        "gemini-2.5-flash": "gemini-3-flash",
         "gemini-2.0-flash-thinking": "gemini-3-flash-thinking",
         "gemini-2.0-flash": "gemini-3-flash",
         "gemini-1.5-pro": "gemini-3-pro",
@@ -229,6 +233,10 @@ async def startup():
 @app.get("/v1/models")
 async def list_models():
     return {"object": "list", "data": [
+        {"id": "gemini-3-pro", "owned_by": "google"},
+        {"id": "gemini-3-flash", "owned_by": "google"},
+        {"id": "gemini-3-flash-thinking", "owned_by": "google"},
+        {"id": "gemini-2.5-flash", "owned_by": "google"},
         {"id": "gemini-2.0-flash-thinking", "owned_by": "google"},
         {"id": "gemini-2.0-flash", "owned_by": "google"},
         {"id": "gemini-1.5-pro", "owned_by": "google"},
