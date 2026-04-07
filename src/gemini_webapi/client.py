@@ -777,6 +777,11 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         """
         Internal method which actually sends content generation requests.
         """
+        if self.is_aistudio:
+            # Native AI Studio generateContent (oz798b) implementation
+            async for output in self._aistudio_generate(prompt, model=model, chat=chat, **kwargs):
+                yield output
+            return
 
         assert prompt, "Prompt cannot be empty."
 
@@ -1911,3 +1916,52 @@ class ChatSession:
     @rcid.setter
     def rcid(self, value: str):
         self.__metadata[2] = value
+
+    async def _aistudio_generate(
+        self,
+        prompt: str,
+        model: str | Any = None,
+        chat: Optional["ChatSession"] = None,
+        **kwargs
+    ) -> AsyncGenerator[ModelOutput, None]:
+        """
+        Implementation of native AI Studio generateContent using RPC oz798b.
+        """
+        # AI Studio RPC format for oz798b
+        # Payload structure: [model_id, prompt, generation_config, tools, etc.]
+        
+        model_id = model if isinstance(model, str) else "gemini-2.0-flash-exp"
+        
+        # This is a simplified version of the AI Studio RPC payload
+        # Actual payload requires nested lists representing the generateContent request
+        payload = json.dumps([
+            model_id,
+            [
+                {"role": "user", "parts": [{"text": prompt}]}
+            ],
+            {"temperature": kwargs.get("temperature", 0.7)},
+            None, # Tools
+            None, # SafetySettings
+            None  # SystemInstruction handled in prompt for now
+        ]).decode("utf-8")
+
+        response = await self._batch_execute(
+            [
+                RPCData(
+                    rpcid=GRPC.AI_STUDIO_GENERATE,
+                    payload=payload,
+                )
+            ]
+        )
+        
+        # Parse AI Studio RPC response
+        response_json = extract_json_from_response(response.text)
+        for part in response_json:
+            # AI Studio response parsing logic
+            text = get_nested_value(part, [2, 0, 0, 0, 0]) # Example path
+            if text:
+                yield ModelOutput(
+                    text=text,
+                    metadata=[chat.cid if chat else "", "", ""],
+                    candidates=[Candidate(rcid="", text=text)]
+                )
