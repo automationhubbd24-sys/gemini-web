@@ -16,7 +16,7 @@ from ..exceptions import AuthError
 
 
 async def _send_request(
-    client: AsyncSession, cookies: dict | Cookies, verbose: bool = False
+    client: AsyncSession, cookies: dict | Cookies, is_aistudio: bool = False, verbose: bool = False
 ) -> Response:
     """
     Send http request with provided cookies using a shared session.
@@ -29,9 +29,10 @@ async def _send_request(
         for k, v in cookies.items():
             client.cookies.set(k, v, domain=".google.com")
 
-    response = await client.get(Endpoint.INIT, headers=Headers.GEMINI.value)
+    init_url = Endpoint.AI_STUDIO_INIT if is_aistudio else Endpoint.INIT
+    response = await client.get(init_url, headers=Headers.GEMINI.value)
     if verbose:
-        logger.debug(f"HTTP Request: GET {Endpoint.INIT} [{response.status_code}]")
+        logger.debug(f"HTTP Request: GET {init_url} [{response.status_code}]")
     response.raise_for_status()
     return response
 
@@ -39,6 +40,7 @@ async def _send_request(
 async def get_access_token(
     base_cookies: dict | Cookies,
     proxy: str | None = None,
+    is_aistudio: bool = False,
     verbose: bool = False,
     verify: bool = True,
 ) -> tuple[str | None, str | None, str | None, str | None, str | None, AsyncSession]:
@@ -268,7 +270,7 @@ async def get_access_token(
     for jar, group_name in cookie_jars_to_test:
         current_attempt += 1
         try:
-            response = await _send_request(client, jar, verbose=verbose)
+            response = await _send_request(client, jar, is_aistudio=is_aistudio, verbose=verbose)
             access_token = re.search(r'"SNlM0e":\s*"(.*?)"', response.text)
             build_label = re.search(r'"cfb2h":\s*"(.*?)"', response.text)
             session_id = re.search(r'"FdrFJe":\s*"(.*?)"', response.text)

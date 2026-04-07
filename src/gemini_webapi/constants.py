@@ -33,6 +33,10 @@ class Endpoint(StrEnum):
     ROTATE_COOKIES = "https://accounts.google.com/RotateCookies"
     UPLOAD = "https://content-push.googleapis.com/upload"
     BATCH_EXEC = "https://gemini.google.com/_/BardChatUi/data/batchexecute"
+    
+    # AI Studio Endpoints
+    AI_STUDIO_INIT = "https://aistudio.google.com/app"
+    AI_STUDIO_BATCH_EXEC = "https://aistudio.google.com/_/AistudioUi/data/batchexecute"
 
 
 class GRPC(StrEnum):
@@ -67,6 +71,9 @@ class GRPC(StrEnum):
     GET_FULL_SIZE_IMAGE = "c8o8Fe"
 
     BARD_SETTINGS = "ESY5D"
+    
+    # AI Studio specific RPCs
+    AI_STUDIO_GENERATE = "oz798b"
 
 
 class Headers(Enum):

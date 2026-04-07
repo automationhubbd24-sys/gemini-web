@@ -44,7 +44,7 @@ async def warm_up_clients():
             for cookie in cookies:
                 if cookie.gmail not in active_clients:
                     try:
-                        client = GeminiClient(cookie.secure_1psid, cookie.secure_1psidts)
+                        client = GeminiClient(cookie.secure_1psid, cookie.secure_1psidts, is_aistudio=True)
                         await client.init(timeout=30, auto_refresh=True)
                         async with client_lock:
                             active_clients[cookie.gmail] = (client, time.time())
@@ -136,8 +136,9 @@ async def get_next_client(db: Session) -> GeminiClient:
     if selected.gmail in active_clients: return active_clients[selected.gmail][0]
     
     async with client_lock:
-        client = GeminiClient(selected.secure_1psid, selected.secure_1psidts)
-        await client.init(timeout=20, auto_refresh=True)
+        # Initializing as AI Studio Client (No Playwright/Puppeteer)
+        client = GeminiClient(selected.secure_1psid, selected.secure_1psidts, is_aistudio=True)
+        await client.init(timeout=30, auto_refresh=True)
         active_clients[selected.gmail] = (client, time.time())
         return client
 
@@ -290,10 +291,6 @@ async def startup():
 @app.get("/v1/models")
 async def list_models():
     return {"object": "list", "data": [
-        {"id": "gemini-3-pro", "owned_by": "google"},
-        {"id": "gemini-3-flash", "owned_by": "google"},
-        {"id": "gemini-3-flash-thinking", "owned_by": "google"},
-        {"id": "gemini-2.5-flash", "owned_by": "google"},
         {"id": "gemini-2.0-flash-thinking", "owned_by": "google"},
         {"id": "gemini-2.0-flash", "owned_by": "google"},
         {"id": "gemini-1.5-pro", "owned_by": "google"},

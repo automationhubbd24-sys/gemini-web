@@ -118,6 +118,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         "_recent_chats",  # From ChatMixin
         "_gems",  # From GemMixin
         "account_status",
+        "is_aistudio",
         "kwargs",
     ]
 
@@ -126,11 +127,13 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         secure_1psid: str | None = None,
         secure_1psidts: str | None = None,
         proxy: str | None = None,
+        is_aistudio: bool = True,
         **kwargs,
     ):
         super().__init__()
         self._cookies = Cookies()
         self.proxy = proxy
+        self.is_aistudio = is_aistudio
         self._running: bool = False
         self.client: AsyncSession | None = None
         self.access_token: str | None = None
@@ -233,6 +236,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                 ) = await get_access_token(
                     base_cookies=self.cookies,
                     proxy=self.proxy,
+                    is_aistudio=self.is_aistudio,
                     verbose=self.verbose,
                     verify=self.kwargs.get("verify", True),
                 )
@@ -1601,9 +1605,11 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                 **Headers.BATCH_EXEC.value,
                 **Headers.SAME_DOMAIN.value,
             }
+            
+            exec_endpoint = Endpoint.AI_STUDIO_BATCH_EXEC if self.is_aistudio else Endpoint.BATCH_EXEC
 
             response = await self.client.post(
-                Endpoint.BATCH_EXEC,
+                exec_endpoint,
                 params=params,
                 headers=request_headers,
                 data={
