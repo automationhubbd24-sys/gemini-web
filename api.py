@@ -153,31 +153,30 @@ async def chat_completions(request: OpenAIRequest, token: str = Depends(verify_t
     client = await get_next_client(db)
     system_instruction, full_history = await extract_transcript(request.messages)
     
-    # AI Studio RPC-specific payload construction
-    # We use oz798b as it is the primary RPC for generateContent in AI Studio
-    # This avoids the "hanging" problem by using the correct internal IDs
-    
+    # Comprehensive AI Studio Native Mapping with Fallback
     model_map = {
         "gemini-2.0-flash-thinking": "gemini-2.0-flash-thinking-exp",
         "gemini-2.0-flash": "gemini-2.0-flash-exp",
         "gemini-1.5-pro": "gemini-1.5-pro",
         "gemini-1.5-flash": "gemini-1.5-flash",
-        "gemini-2.5-flash": "gemini-2.0-flash-exp"  # Fallback for now
+        "gemini-2.5-flash": "gemini-2.0-flash-exp",
+        "gemini-3-flash": "gemini-2.0-flash-exp",
+        "gemini-3-pro": "gemini-1.5-pro"
     }
     target_model = model_map.get(request.model.lower(), "gemini-2.0-flash-exp")
 
     try:
-        # Use a more reliable way to send content for AI Studio
-        # Instead of generic send_message, we use a custom batch_execute if needed
-        # For now, let's optimize the prompt and headers to prevent 2 min delay
-        
+        # Log request for debugging
+        db.add(Log(event_type="info", message=f"Processing request for model: {request.model} mapping to {target_model}"))
+        db.commit()
+
         chat = client.start_chat(model=target_model)
         
-        # Proper AI Studio formatting for RPC
-        final_prompt = f"System: {system_instruction}\n\nHistory:\n{full_history}\n\nUser: Respond as an AI Studio model."
+        # Enhanced Prompt for better RPC stability
+        final_prompt = f"SYSTEM: {system_instruction}\n\nHISTORY:\n{full_history}\n\nUSER: {request.messages[-1].content}"
         
-        # Set a shorter timeout for immediate feedback
-        response = await asyncio.wait_for(chat.send_message(final_prompt), timeout=60)
+        # Slightly longer timeout but with better feedback
+        response = await asyncio.wait_for(chat.send_message(final_prompt), timeout=90)
         
         return {
             "id": f"chatcmpl-{int(time.time())}",
