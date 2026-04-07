@@ -161,7 +161,8 @@ async def chat_completions(request: OpenAIRequest, token: str = Depends(verify_t
         "gemini-2.0-flash-thinking": "gemini-2.0-flash-thinking-exp",
         "gemini-2.0-flash": "gemini-2.0-flash-exp",
         "gemini-1.5-pro": "gemini-1.5-pro",
-        "gemini-1.5-flash": "gemini-1.5-flash"
+        "gemini-1.5-flash": "gemini-1.5-flash",
+        "gemini-2.5-flash": "gemini-2.0-flash-exp"  # Fallback for now
     }
     target_model = model_map.get(request.model.lower(), "gemini-2.0-flash-exp")
 
