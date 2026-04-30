@@ -231,8 +231,15 @@ async def chat_completions(request: OpenAIRequest, token: str = Depends(verify_t
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         }
     except asyncio.TimeoutError:
+        db.add(Log(event_type="error", message=f"TimeoutError: Request timed out for model {request.model}"))
+        db.commit()
         raise HTTPException(status_code=504, detail="AI Studio RPC timed out. Check your cookies or network.")
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        db.add(Log(event_type="error", message=f"RPC Error for model {request.model}: {str(e)}\nDetails: {error_details}"))
+        db.commit()
+        print(f"ERROR: {error_details}") # Print to console/logs for easier debugging
         raise HTTPException(status_code=500, detail=f"RPC Error: {str(e)}")
 
 # --- Dashboard ---
