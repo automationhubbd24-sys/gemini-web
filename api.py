@@ -44,7 +44,8 @@ async def warm_up_clients():
             for cookie in cookies:
                 if cookie.gmail not in active_clients:
                     try:
-                        client = GeminiClient(cookie.secure_1psid, cookie.secure_1psidts, is_aistudio=True)
+                        # Initializing as Standard Gemini Web Client
+                        client = GeminiClient(cookie.secure_1psid, cookie.secure_1psidts, is_aistudio=False)
                         await client.init(timeout=30, auto_refresh=True)
                         async with client_lock:
                             active_clients[cookie.gmail] = (client, time.time())
