@@ -129,7 +129,15 @@ async def get_next_client(db: Session) -> GeminiClient:
     
     # Refresh cache if empty or expired
     if not cookie_cache or (curr - last_db_refresh) > 60:
-        cookie_cache = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").all()
+        cookies = db.query(Cookie).filter(Cookie.is_active == True, Cookie.status == "alive").all()
+        # Store as simple dictionaries to avoid DetachedInstanceError
+        cookie_cache = [{
+            "id": c.id,
+            "gmail": c.gmail,
+            "secure_1psid": c.secure_1psid,
+            "secure_1psidts": c.secure_1psidts,
+            "status": c.status
+        } for c in cookies]
         last_db_refresh = curr
         
     if not cookie_cache:
@@ -139,26 +147,26 @@ async def get_next_client(db: Session) -> GeminiClient:
     rotation_index += 1
     
     # Check if client is already in cache
-    if selected.gmail in active_clients:
-        return active_clients[selected.gmail][0]
+    if selected["gmail"] in active_clients:
+        return active_clients[selected["gmail"]][0]
     
     async with client_lock:
         try:
             # Initializing as Standard Gemini Web Client (Better compatibility with regular cookies)
-            client = GeminiClient(selected.secure_1psid, selected.secure_1psidts, is_aistudio=False)
+            client = GeminiClient(selected["secure_1psid"], selected["secure_1psidts"], is_aistudio=False)
             await client.init(timeout=30, auto_refresh=True)
-            active_clients[selected.gmail] = (client, time.time())
+            active_clients[selected["gmail"]] = (client, time.time())
             return client
         except Exception as e:
-            # Mark cookie as dead if initialization fails
-            selected.status = "dead"
-            db.add(Log(event_type="error", message=f"Failed to initialize client for {selected.gmail}: {str(e)}", gmail=selected.gmail))
+            # Mark cookie as dead in database
+            db.query(Cookie).filter(Cookie.id == selected["id"]).update({"status": "dead"})
+            db.add(Log(event_type="error", message=f"Failed to initialize client for {selected['gmail']}: {str(e)}", gmail=selected["gmail"]))
             db.commit()
             
             # Remove from local cache list and cache map
-            if selected.gmail in active_clients:
-                del active_clients[selected.gmail]
-            cookie_cache = [c for c in cookie_cache if c.id != selected.id]
+            if selected["gmail"] in active_clients:
+                del active_clients[selected["gmail"]]
+            cookie_cache = [c for c in cookie_cache if c["id"] != selected["id"]]
             
             if not cookie_cache:
                 raise HTTPException(status_code=503, detail="All available cookies have failed. Please provide new cookies.")
