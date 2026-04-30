@@ -188,18 +188,18 @@ async def chat_completions(request: OpenAIRequest, token: str = Depends(verify_t
     
     # Comprehensive AI Studio Native Mapping with Fallback
     model_map = {
-        "fast": "gemini-2.0-flash-exp",
-        "thinking": "gemini-2.0-flash-thinking-exp",
-        "pro": "gemini-1.5-pro",
-        "gemini-3-flash": "gemini-2.0-flash-exp",
-        "gemini-3-pro": "gemini-1.5-pro",
-        "gemini-2.0-flash-thinking": "gemini-2.0-flash-thinking-exp",
-        "gemini-2.0-flash": "gemini-2.0-flash-exp",
-        "gemini-1.5-pro": "gemini-1.5-pro",
-        "gemini-1.5-flash": "gemini-1.5-flash",
-        "gemini-2.5-flash": "gemini-2.0-flash-exp"
+        "fast": "gemini-3-flash",
+        "thinking": "gemini-3-flash-thinking",
+        "pro": "gemini-3-pro",
+        "gemini-3-flash": "gemini-3-flash",
+        "gemini-3-pro": "gemini-3-pro",
+        "gemini-2.0-flash-thinking": "gemini-3-flash-thinking",
+        "gemini-2.0-flash": "gemini-3-flash",
+        "gemini-1.5-pro": "gemini-3-pro",
+        "gemini-1.5-flash": "gemini-3-flash",
+        "gemini-2.5-flash": "gemini-3-flash"
     }
-    target_model = model_map.get(request.model.lower(), "gemini-2.0-flash-exp")
+    target_model = model_map.get(request.model.lower(), "gemini-3-flash")
 
     try:
         # Log request for debugging
