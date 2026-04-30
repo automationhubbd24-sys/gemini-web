@@ -72,57 +72,161 @@ class OpenAIRequest(BaseModel):
     tool_choice: Optional[Any] = None
 
 # --- Helpers ---
-async def download_files_from_message(message: str, client: GeminiClient = None) -> List[str]:
-    urls = URL_REGEX.findall(message)
-    temp_files = []
-    if not urls: return []
-    for url in urls:
-        try:
-            session = client.client if client else None
-            if not session:
-                from curl_cffi.requests import AsyncSession
-                session = AsyncSession()
-            response = await session.get(url, timeout=30)
-            if response.status_code == 200:
-                ext = ".bin"
-                ct = response.headers.get("content-type", "")
-                if "image" in ct: ext = ".png"
-                elif "pdf" in ct: ext = ".pdf"
-                fd, temp_path = tempfile.mkstemp(suffix=ext)
-                with os.fdopen(fd, 'wb') as f: f.write(response.content)
-                temp_files.append(temp_path)
-        except: pass
-    return temp_files
-
-def format_tools_as_instruction(tools: List[Dict[str, Any]]) -> str:
-    """Simulate native function calling behavior via advanced prompting."""
-    if not tools: return ""
-    instruction = "\n\n[SYSTEM_PROTOCOL: AGENT_MODE_ACTIVE]\n"
-    instruction += "You are an advanced AI Agent. Use tools by outputting ONLY a JSON block:\n"
-    instruction += "```json\n{\"tool_call\": {\"name\": \"fn_name\", \"arguments\": {...}}}\n```\n"
-    instruction += "Available Tools:\n"
+def format_tools_instruction(tools, user_question=""):
+    instruction = "\n=== MANDATORY TOOL USAGE ===\n"
+    instruction += "You MUST use one of the tools below to answer this question.\n"
+    instruction += "Do NOT answer directly. Do NOT say you don't have information.\n"
+    instruction += "You MUST respond with ONLY a JSON object to call the tool.\n\n"
+    
+    instruction += "RESPONSE FORMAT - respond with ONLY this JSON, nothing else:\n"
+    instruction += '{"tool_calls": [{"name": "TOOL_NAME", "arguments": {"param": "value"}}..]}\n\n'
+    
+    instruction += "RULES:\n"
+    instruction += "- Your ENTIRE response must be valid JSON only\n"
+    instruction += "- No markdown, no code blocks, no explanation\n"
+    instruction += "- No text before or after the JSON\n\n"
+    
+    instruction += "Available tools:\n\n"
+    
     for tool in tools:
-        f = tool.get("function", {})
-        instruction += f"- {f.get('name')}: {f.get('description')}. Schema: {json.dumps(f.get('parameters', {}))}\n"
+        func = tool.get("function", tool)
+        name = func.get("name", "unknown")
+        desc = func.get("description", "No description")
+        params = func.get("parameters", {})
+        
+        instruction += f"Tool: {name}\n"
+        instruction += f"Description: {desc}\n"
+        
+        if params.get("properties"):
+            instruction += "Parameters:\n"
+            required_params = params.get("required", [])
+            for param_name, param_info in params["properties"].items():
+                param_type = param_info.get("type", "string")
+                param_desc = param_info.get("description", "")
+                is_required = "required" if param_name in required_params else "optional"
+                instruction += f"  - {param_name} ({param_type}, {is_required}): {param_desc}\n"
+        instruction += "\n"
+    
+    instruction += "=== END OF TOOLS ===\n\n"
+    
+    first_tool = tools[0] if tools else {}
+    first_func = first_tool.get("function", first_tool)
+    first_name = first_func.get("name", "tool")
+    
+    instruction += f'EXAMPLE: If the user asks a question, respond with:\n'
+    instruction += '{"tool_calls": [{"name": "' + first_name + '", "arguments": {"input": "the user question here"}}..]}\n\n'
+    
+    instruction += "Now respond with the JSON to call the appropriate tool:\n\n"
     return instruction
 
-async def extract_transcript(messages: List[OpenAIMessage]) -> tuple[str, str]:
-    """Extract system instruction and rebuild conversation for AI Studio behavior."""
-    sys_inst = "You are a helpful AI assistant."
-    transcript = []
+def parse_tool_calls(response_text):
+    import uuid
+    cleaned = response_text.strip()
+    if "```" in cleaned:
+        code_block_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', cleaned, re.DOTALL)
+        if code_block_match:
+            cleaned = code_block_match.group(1).strip()
+    
+    json_candidates = [cleaned]
+    json_match = re.search(r'\{[\s\S]*"tool_calls"[\s\S]*\}', cleaned)
+    if json_match:
+        json_candidates.append(json_match.group(0))
+    
+    for candidate in json_candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict) and "tool_calls" in parsed:
+                raw_calls = parsed["tool_calls"]
+                if isinstance(raw_calls, list) and len(raw_calls) > 0:
+                    formatted_calls = []
+                    for call in raw_calls:
+                        tool_name = call.get("name", "")
+                        arguments = call.get("arguments", {})
+                        if isinstance(arguments, dict):
+                            arguments_str = json.dumps(arguments, ensure_ascii=False)
+                        else:
+                            arguments_str = str(arguments)
+                        
+                        formatted_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:24]}",
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": arguments_str
+                            }
+                        })
+                    return formatted_calls
+        except (json.JSONDecodeError, TypeError, KeyError):
+            continue
+    return None
+
+async def extract_transcript(messages: List[OpenAIMessage], tools=None) -> str:
+    parts = []
+    system_parts = []
+    has_tool_results = False
+    user_question = ""
+    
     for msg in messages:
-        if msg.role == "system":
-            sys_inst = msg.content if isinstance(msg.content, str) else str(msg.content)
-        elif msg.role == "user":
-            transcript.append(f"User: {msg.content}")
-        elif msg.role == "assistant":
-            transcript.append(f"Assistant: {msg.content}")
+        role = msg.role
+        content = msg.content
+        
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    text_parts.append(item.get("text", item.get("content", str(item))))
+                else:
+                    text_parts.append(str(item))
+            content = "\n".join(text_parts)
+        
+        if role == "system":
+            system_parts.append(content)
+        elif role == "tool":
+            has_tool_results = True
+            tool_name = getattr(msg, "name", "tool")
+            parts.append(f"[TOOL RESULT from '{tool_name}']:\n{content}")
+        elif role == "assistant":
+            assistant_content = content if content else ""
             if msg.tool_calls:
+                tc_descriptions = []
                 for tc in msg.tool_calls:
-                    transcript.append(f"Tool Call: {tc['function']['name']}({tc['function']['arguments']})")
-        elif msg.role == "tool":
-            transcript.append(f"Tool Response: {msg.content}")
-    return sys_inst, "\n".join(transcript)
+                    func = tc.get("function", {})
+                    tc_descriptions.append(f"Called '{func.get('name', '?')}' with: {func.get('arguments', '{}')}")
+                assistant_content += "\n[Previous tool calls: " + "; ".join(tc_descriptions) + "]"
+            if assistant_content.strip():
+                parts.append(f"[Assistant]: {assistant_content}")
+        elif role == "user":
+            user_question = content
+            parts.append(content)
+            has_tool_results = False
+    
+    final = ""
+    if system_parts:
+        if tools and not has_tool_results:
+            final += "=== YOUR ROLE ===\n"
+            final += "\n\n".join(system_parts)
+            final += "\n=== END OF ROLE ===\n\n"
+        else:
+            final += "=== SYSTEM INSTRUCTIONS (FOLLOW STRICTLY) ===\n"
+            final += "\n\n".join(system_parts)
+            final += "\n=== END OF INSTRUCTIONS ===\n\n"
+    
+    if tools and not has_tool_results:
+        final += format_tools_instruction(tools, user_question)
+    
+    if has_tool_results:
+        final += "=== CONTEXT FROM TOOLS ===\n"
+        final += "The following information was retrieved by the tools you requested.\n"
+        final += "Use ONLY this information to answer the user's question.\n\n"
+    
+    if parts:
+        final += "\n".join(parts)
+    
+    if has_tool_results:
+        final += "\n\n=== INSTRUCTION ===\n"
+        final += "Now answer the user's question based ONLY on the tool results above.\n"
+    
+    return final
 
 async def get_next_client(db: Session) -> GeminiClient:
     global active_clients, rotation_index, cookie_cache, last_db_refresh
@@ -184,7 +288,9 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security), 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: OpenAIRequest, token: str = Depends(verify_token), db: Session = Depends(get_db)):
     client = await get_next_client(db)
-    system_instruction, full_history = await extract_transcript(request.messages)
+    
+    # Enhanced prompt building with tool support from mse_ai_api
+    final_prompt = await extract_transcript(request.messages, tools=request.tools)
     
     # Comprehensive AI Studio Native Mapping with Fallback
     model_map = {
@@ -208,28 +314,49 @@ async def chat_completions(request: OpenAIRequest, token: str = Depends(verify_t
 
         chat = client.start_chat(model=target_model)
         
-        # Enhanced Prompt for better RPC stability
-        final_prompt = f"SYSTEM: {system_instruction}\n\nHISTORY:\n{full_history}\n\nUSER: {request.messages[-1].content}"
-        
         # Slightly longer timeout but with better feedback
         response = await asyncio.wait_for(chat.send_message(final_prompt), timeout=90)
+        response_text = response.text
         
-        return {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": request.model,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": response.text,
-                    "tool_calls": None
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        }
+        # Parse tool calls if tools were provided
+        tool_calls = None
+        if request.tools:
+            tool_calls = parse_tool_calls(response_text)
+
+        if tool_calls:
+            return {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": tool_calls
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            }
+        else:
+            return {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_text,
+                        "tool_calls": None
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            }
     except asyncio.TimeoutError:
         db.add(Log(event_type="error", message=f"TimeoutError: Request timed out for model {request.model}"))
         db.commit()
